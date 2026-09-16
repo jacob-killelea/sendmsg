@@ -28,41 +28,33 @@ There is no `CInverterFullRateTelemetryCommand`. Two distinct messages:
 
 This script sends the first one.
 
-## One-time setup
-
-`libcmessage_decoder.so` is built against **glibc 2.38**. This workstation is Ubuntu 22.04
-(glibc 2.35), so the script cannot run natively here — it needs the DDE image (glibc 2.39,
-Python 3.12). Build a venv inside that image:
-
-```bash
-mkdir -p ~/Desktop/sendmsg/dde
-docker run --rm -v ~/.config/pip/pip.conf:/etc/pip.conf:ro \
-  -v ~/Desktop/sendmsg/dde:/scratch --entrypoint /bin/bash dde:latest \
-  -c 'python3 -m venv /scratch/ddevenv && /scratch/ddevenv/bin/pip install -q cmessage-asyncio'
-```
-
-The `~/Desktop/sendmsg` venv is a host Python 3.10 one and is **not** usable for this — it
-is fine for `--help` and reading the code, nothing more.
-
 ## Running it
 
-Streams the command at 2 Hz until Ctrl-C:
-
 ```bash
-docker run --rm -it --network container:flight_computer_2p1_remote_1 \
-  -v ~/Joby:$HOME/Joby:ro -v ~/.Joby:$HOME/.Joby \
-  -v ~/Desktop/sendmsg/dde:/scratch \
-  -v ~/Desktop/sendmsg/send_qi_full_rate_telemetry.py:/tmp/send_qi.py:ro \
-  -e HOME=$HOME --entrypoint /bin/bash dde:latest \
-  -c '/scratch/ddevenv/bin/python /tmp/send_qi.py --local-ip 192.168.144.1'
+./run.sh                             # stream at 2 Hz until Ctrl-C
+./run.sh --channels 21,22,23 --rate 5
+./run.sh --stop                      # disable all slots and exit
+./run.sh --dry-run                   # print the message without sending
 ```
+
+`run.sh` does everything: on first use it builds a venv in the DDE image (a minute or two,
+then cached in `~/.cache/sendmsg-dde`), and every run wraps the script in `docker run`.
+Arguments pass straight through.
+
+Two reasons it cannot just be `python send_qi_full_rate_telemetry.py`:
+
+- `libcmessage_decoder.so` is built against **glibc 2.38**. This workstation is Ubuntu 22.04
+  (glibc 2.35), so the decoder will not load natively; the DDE image is glibc 2.39 /
+  Python 3.12. The venv in `~/Desktop/sendmsg` is a host Python 3.10 one — fine for
+  `--help` and reading the code, useless for sending.
+- The packets have to be sourced from a flight computer address (see below).
 
 Expected output:
 
 ```
 schema CMessageUnifiedSchemaIdentifier(usid='a6c9ac2467680ff5'),
   CSignalAnalysisDataEngineCommandMessage is msg id 827
-bound 192.168.144.1:1928 -> 192.168.144.35:1929
+bound 192.168.144.1:1928 -> 192.168.144.35:1929 (startup count 1789496423)
 arming channels [1, 2, 3, 4, 5, 6, 7, 8] at 2 Hz (engine stops 1000 ms after the last command)
 sent #1
 ```
@@ -95,6 +87,30 @@ with the running container.
 
 The script warns if `--local-ip` is not one of the three FC addresses.
 
+### Every run must present a new startup count
+
+The second silent-drop trap, and the reason each run prints a `startup count`.
+
+The inverter's `CSequenceChecker` caches `(startup count, sequence number)` per sender node
+and keeps it until the inverter reboots. `cmessage_asyncio` restarts its sequence number at
+`1` for every new connection. So if two runs present the *same* startup count, the second
+one's packets look stale:
+
+| | startup count | seqnos sent | verdict |
+| --- | --- | --- | --- |
+| Run 1 | 1 | 1…11 | accepted; inverter caches `seq=11` |
+| Run 2 | 1 (same) | 1…5 | `seqDelta = 1-11 = -10` → `eOutOfSequence`, **discarded** |
+
+Discarded packets do not update the cache, so *everything* at or below the previous run's
+high-water mark drops, and `evaluatePacket()` logs nothing on that path at all. Symptom: one
+command appears to land and the rest vanish, erratically, depending on where the seqnos fall.
+
+The fix is built in — the startup count defaults to `int(time.time())`, so every run
+presents a new one, which reads as `eNodeRestart` and resets the inverter's cached sequence
+number. It does **not** need to be monotonic: a *lower* count reads as
+`eOutOfSequenceStartup`, which `IsInSequence()` also accepts. Override with
+`--node-start-count` if you ever need a specific value.
+
 ## Options
 
 | Option | Default | Notes |
@@ -109,6 +125,7 @@ The script warns if `--local-ip` is not one of the three FC addresses.
 | `--count` | `0` (forever) | stop after N commands |
 | `--category` / `--position` | `eQuadInverter` / `e1A` | the recipient LRU |
 | `--node-id` | `0` | `NodeIdOfOriginator` stamped on the message |
+| `--node-start-count` | `int(time.time())` | packet-header startup count; must differ per run — see above |
 | `--schema-hash` | local build | purple_rain USID to encode with |
 | `--stop` | | one command with all slots disabled, then exit |
 | `--disarm-on-exit` | | disable all slots on exit instead of waiting out the watchdog |
@@ -169,7 +186,9 @@ sudo tcpdump -ni netA-air 'src 192.168.144.35 and udp' -c 20
 ## Troubleshooting
 
 **`could not load libcmessage_decoder.so: ... GLIBC_2.38 not found`**
-Running on the host instead of in the DDE container. See [One-time setup](#one-time-setup).
+Running on the host instead of in the DDE container — use `./run.sh`. The script reports the
+host's glibc alongside the raw `dlerror` text, so an unrelated load failure (missing file,
+wrong arch) prints the same way; read the quoted error, not just the hint.
 
 **`CSignalAnalysisDataEngineCommandMessage is not in schema ...`**
 The selected purple_rain package predates the SADE. The message only exists on
@@ -179,12 +198,21 @@ The selected purple_rain package predates the SADE. The message only exists on
 
 **It silently picks a stale schema**
 The shim finds the local build via `joby_root.get_joby_root()`, which needs `JOBY_ROOT` set
-or the CWD inside the Joby repo. Run from anywhere else and it falls back to whatever is
-cached in `~/.Joby/purple_rain/downloads` — it was picking up `v2.1.17` this way. The script
-sets `JOBY_ROOT=~/Joby` at import time to prevent that; override the env var to change it.
+or the CWD inside the Joby repo. Worse than it sounds: the fallback is the *git root of the
+CWD*, and `~/Desktop/sendmsg` is itself a git repo, so from here it returns a confidently
+wrong answer, skips the local zip, and encodes against whatever is cached in
+`~/.Joby/purple_rain/downloads` — it was picking up `v2.1.17` this way. The script sets
+`JOBY_ROOT=~/Joby` before the purple_rain imports to prevent that (it has to be the env var:
+`purple_rain_constants` snapshots it at import and `from_version()` takes no search-root
+argument). Override the env var to change it.
 
 **`dropping packet from node N; unexpected sender`**
 Wrong source IP. See the table above. Node 109 is this workstation.
+
+**Commands land at first, then silently stop being accepted**
+Sequence-checker drop. See [Every run must present a new startup
+count](#every-run-must-present-a-new-startup-count). If you passed `--node-start-count`
+explicitly, pass a different value or drop the flag to get the clock default back.
 
 **Nothing at all happens, no console output either**
 Check the target is actually running the SADE firmware. Also worth confirming what is at
