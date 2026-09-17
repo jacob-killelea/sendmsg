@@ -1,7 +1,8 @@
 # Quad Inverter Full-Rate Telemetry — user guide
 
 `send_qi_full_rate_telemetry.py` arms the Signal Analysis Data Engine (SADE) on a quad
-inverter so it publishes full-rate (39 kHz nominal) selectable telemetry.
+inverter so it publishes full-rate (39 kHz nominal) selectable telemetry, and receives that
+telemetry.
 
 It is the ground half of the loop described in
 `~/Joby/SIGNAL_ANALYSIS_DATA_ENGINE_TODO.md`, and exists to exercise the **B1 end-to-end**
@@ -14,7 +15,8 @@ GROUND (this script)                                QUAD INVERTER 1A (192.168.14
   (the command is its own keep-alive)                     └▶ ActivateFullRateLogger()
 
   CInverterFullRateTelemetryMessage         ◀──────   1 msg / channel / 1 ms
-  {Channel, Decimation, FrameIndex, 44x float32}      routed to the FSDR, not to us
+  {Channel, Decimation, FrameIndex, 44x float32}      addressed to the FSDR, not to us:
+  (`--receive-only`, bound in the FSDR's netns)       192.168.144.226:1771
 ```
 
 ## Naming
@@ -26,7 +28,9 @@ There is no `CInverterFullRateTelemetryCommand`. Two distinct messages:
 | `CSignalAnalysisDataEngineCommandMessage` | ground → inverter | **the command.** Selects channels, arms the logger |
 | `CInverterFullRateTelemetryMessage` | inverter → FSDR | the telemetry that comes back |
 
-This script sends the first one.
+This script sends the first one and receives the second one — but not in the same process,
+because the two ends need different source addresses. See [Receiving the
+telemetry](#receiving-the-telemetry).
 
 ## Running it
 
@@ -35,11 +39,15 @@ This script sends the first one.
 ./run.sh --channels 21,22,23 --rate 5
 ./run.sh --stop                      # disable all slots and exit
 ./run.sh --dry-run                   # print the message without sending
+
+./run.sh --receive-only              # in a second terminal: receive the telemetry
+./run.sh --receive-only --csv /captures/run1.csv --dump 2
 ```
 
 `run.sh` does everything: on first use it builds a venv in the DDE image (a minute or two,
 then cached in `~/.cache/sendmsg-dde`), and every run wraps the script in `docker run`.
-Arguments pass straight through.
+Arguments pass straight through. It picks the network namespace from them: `--receive-only`
+runs in the FSDR's, everything else in a flight computer's.
 
 Two reasons it cannot just be `python send_qi_full_rate_telemetry.py`:
 
@@ -111,6 +119,73 @@ number. It does **not** need to be monotonic: a *lower* count reads as
 `eOutOfSequenceStartup`, which `IsInSequence()` also accepts. Override with
 `--node-start-count` if you ever need a specific value.
 
+## Receiving the telemetry
+
+`--receive-only` binds the port the inverter unicasts telemetry to and reports what arrives.
+It sends nothing, so it runs in its own terminal alongside a streaming sender.
+
+```
+schema CMessageUnifiedSchemaIdentifier(usid='a6c9ac2467680ff5'), receive only
+listening for CInverterFullRateTelemetryMessage on 0.0.0.0:1771
+waiting for telemetry; Ctrl-C to stop
+  +   1.0s  8021 msg total, 8 stream(s)
+    source           pos    ch    msg/s  dec frame step  irreg         min        mean         max
+    192.168.144.35   e1A     1     1002    0         44      0      -412.7      0.1382       413.1
+    ...
+```
+
+`msg/s` is that stream's rate in the window just printed, `frame step` the `FrameIndex`
+increment it usually advances by, and `irreg` the number of messages since startup that did
+not follow that step — dropped, duplicated or reordered data. `min`/`mean`/`max` cover every
+sample received in the window, not just the message the line was printed for.
+
+### Where the socket has to sit
+
+The telemetry is **not** addressed to whoever sent the command. `quad_inverter.yaml`
+registers `eInverterFullRateTelemetryMessage → fsdr`, and the inverter's
+`FreeStandingDataRelayTransport` unicasts the `eTelemetry` topic to
+`FreeStandingDataRelayAircraft.1` — node 112 — on the `FreeStandingDataRelayUnicast_SendOnly`
+port, over both flight critical networks:
+
+| Destination | |
+| --- | --- |
+| `192.168.144.226:1771` | blue, the `free_standing_data_relay_plugin_blue_air_1` container |
+| `192.168.145.226:1771` | green, nothing owns this address in the sim lab |
+
+So the receiving socket has to be somewhere `.226` traffic lands, and the sending socket has
+to be a flight computer. No namespace is both, which is why receiving is a separate process:
+`run.sh --receive-only` shares the FSDR container's netns, everything else shares
+`flight_computer_2p1_remote_1`'s.
+
+Two consequences worth knowing:
+
+- If the FSDR plugin is ever started for real it will own port 1771, and the bind fails with
+  `Address already in use` rather than quietly splitting datagrams with it (the socket
+  deliberately does not set `SO_REUSEPORT`). Stop the plugin, or move `--telemetry-port`.
+- One inverter shows up as up to two sources, one per network. Statistics are kept per
+  `(source, channel)`, so those copies stay on separate lines instead of reading as double
+  rate.
+
+### Rate, and what to do with it
+
+Eight channels at one message per millisecond per network is ~16k messages/s, each carrying
+44 float32 samples, so nothing prints per message:
+
+- the per-stream summary every `--summary-interval` seconds (default 1.0) is the default view;
+- `--dump N` prints the first N messages in full, all 44 samples, for eyeballing the shape;
+- `--csv PATH` writes one row per message — about 8 MB/s at full rate. Under `run.sh` only
+  `/captures` is writable, which is `./captures/` on the host: `--csv /captures/run1.csv`.
+
+Every one of those views is subject to the float32 caveat under [Channels](#channels):
+integer and boolean channels read as garbage until the channel policy reaches `Read()`.
+
+### `--watch` instead
+
+`--watch` binds the same telemetry socket in the *sending* process. It is only useful where
+the sender's namespace happens to see `.226` traffic (say `--network host` on a bench with
+no FSDR), and it makes the send loop compete with decoding. `--receive-only` in its own
+terminal is the normal way.
+
 ## Options
 
 | Option | Default | Notes |
@@ -129,9 +204,20 @@ number. It does **not** need to be monotonic: a *lower* count reads as
 | `--schema-hash` | local build | purple_rain USID to encode with |
 | `--stop` | | one command with all slots disabled, then exit |
 | `--disarm-on-exit` | | disable all slots on exit instead of waiting out the watchdog |
-| `--watch` | | print any `CInverterFullRateTelemetryMessage` on this socket |
 | `--dry-run` | | print the message and exit without sending |
 | `--verbose` | | debug logging, and print every send |
+
+Receiving:
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `--receive-only` | | send nothing, only receive telemetry — needs the FSDR's netns |
+| `--watch` | | receive telemetry in the sending process too; rarely what you want |
+| `--telemetry-ip` | `0.0.0.0` | local IP for the telemetry socket |
+| `--telemetry-port` | `1771` | the port the inverter unicasts telemetry to the FSDR on |
+| `--summary-interval` | `1.0` s | seconds between per-stream summaries |
+| `--csv` | | one row per message; `/captures/x.csv` under `run.sh` |
+| `--dump` | `0` | print the first N messages in full |
 
 ### The command is a keep-alive
 
@@ -173,15 +259,24 @@ print a fresh line. What silence cannot distinguish is:
 - the firmware on the target has no SADE tenant, so the message was published to no
   recipient and silently ignored.
 
-The reliable check is a capture on the bench wire while the script streams:
+The check is to receive the telemetry, in a second terminal, while the first one streams the
+command:
 
 ```bash
-sudo tcpdump -ni netA-air 'src 192.168.144.35 and udp' -c 20
+./run.sh                    # terminal 1: arm channels 1..8 at 2 Hz
+./run.sh --receive-only     # terminal 2: count what comes back
 ```
 
-`--watch` will usually show nothing even on success: `quad_inverter.yaml` registers
-`eInverterFullRateTelemetryMessage → fsdr`, so the telemetry is addressed to the FSDR at
-`192.168.144.226`, not to this socket.
+Eight streams at ~1000 msg/s each means the SADE armed and is publishing. `no telemetry`
+there, with the command accepted, is the interesting case — see
+[Receiving the telemetry](#receiving-the-telemetry) for where the socket has to sit, and the
+last two Troubleshooting entries for the states the sim lab is usually in.
+
+Failing that, a capture on the bench wire proves the packets exist without decoding them:
+
+```bash
+sudo tcpdump -ni netA-air 'src 192.168.144.35 and udp port 1771' -c 20
+```
 
 ## Troubleshooting
 
@@ -224,8 +319,18 @@ whether anything is listening.
 
 **No telemetry anywhere, command accepted**
 As of last check the sim lab is provisioned but not launched — `quad_inverter_2p1_1B` and the
-FSDR at `.226` run only `sim-component-service`, with no blue_sky app sockets bound. The
-telemetry has no receiver in that state; capture on the wire instead.
+FSDR at `.226` run only `sim-component-service`, with no blue_sky app sockets bound. Nothing
+is producing telemetry in that state, so `--receive-only` sits at `no telemetry`; capture on
+the wire instead.
+
+**Telemetry is on the wire but `--receive-only` reports nothing**
+Check the socket is in the right namespace first (`run.sh --receive-only` handles that). The
+other way to get silence is a subscription name mismatch: `cmessage_asyncio` keys
+subscriptions on the decoded message's own name, which is the `EMessageType` spelling
+(`eInverterFullRateTelemetryMessage`), not the class spelling the schema is indexed by
+(`CInverterFullRateTelemetryMessage`). Subscribing under the class name raises nothing and
+matches nothing. The script converts with the decoder shim's own
+`CMessageShapeCpp.normalize_cmessage('e', ...)`.
 
 ## Reference
 
@@ -239,3 +344,12 @@ Derived from, in case any of it moves:
 - node id ↔ IP table — `builds/flight_simulation_2p1_gcc/common_configurations/src/configuration_containers/s4_2p1/c_s4_2p1_network_interface_configuration_container.cpp`
 - engine behaviour — `blue_sky/foundations/signal_analysis_data_engine/src/c_signal_analysis_data_engine.cpp`
 - addressing — `purple_rain/.../vehicle_manifest/documents/2p1/aircraft/inverter_project.yaml`
+- telemetry routing — `purple_rain/.../lru_interface_cmessage_registration/lru/quad_inverter.yaml`
+  (`eInverterFullRateTelemetryMessage: [fsdr]`), and the transport that acts on it,
+  `blue_sky/foundations/common_vehicle/src/configurations/c_common_project_configuration_interface.cpp:39`
+- telemetry port — the same `port_configuration_s4_2p1_configs.meta.yaml`
+  (`FreeStandingDataRelayUnicast_SendOnly`: send 1771)
+- FSDR node/address — node 112 = `.226` on both flight critical networks, in the same
+  `c_s4_2p1_network_interface_configuration_container.cpp`
+- telemetry shape — `CInverterFullRateTelemetryMessage` in
+  `~/.Joby/purple_rain/downloads/<version>/output/c_message_definitions.yaml`
