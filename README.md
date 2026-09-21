@@ -4,50 +4,50 @@
 inverter so it publishes full-rate (39 kHz nominal) selectable telemetry, and receives that
 telemetry.
 
-It is the ground half of the loop described in
-`~/Joby/SIGNAL_ANALYSIS_DATA_ENGINE_TODO.md`, and exists to exercise the **B1 end-to-end**
-item: send a real activation command and confirm the algo core logger arms.
+It exists to send a real activation command and confirm the algo core logger arms.
 
 ```
 GROUND (this script)                                QUAD INVERTER 1A (192.168.144.35)
-  CSignalAnalysisDataEngineCommandMessage  ──────▶   FlightComputerTransport
-  {8x channel id, 8x decimation} @ >=1Hz               └▶ CSignalAnalysisDataEngineQuadInverter
-  (the command is its own keep-alive)                     └▶ ActivateFullRateLogger()
+  CSignalAnalysisDataEngineCommandMessage  ------>   FlightComputerTransport
+  {8x channel id, 8x decimation} @ >=1Hz               |> CSignalAnalysisDataEngineQuadInverter
+  (the command is its own keep-alive)                     |> ActivateFullRateLogger()
 
-  CInverterFullRateTelemetryMessage         ◀──────   1 msg / channel / 1 ms
-  {Channel, Decimation, FrameIndex, 44x float32}      addressed to the FSDR, not to us:
-  (`--receive-only`, bound in the FSDR's netns)       192.168.144.226:1771
+  CInverterFullRateTelemetryMessage         <------   1 msg / channel / 1 ms
+  {Channel, Decimation, FrameIndex, 44x float32}      addressed to the FSDR
+  (received unless `--transmit-only`)                 192.168.144.226:1771
 ```
 
 ## Naming
 
-There is no `CInverterFullRateTelemetryCommand`. Two distinct messages:
-
+Two distinct messages:
 | Message | Direction | Role |
 | --- | --- | --- |
-| `CSignalAnalysisDataEngineCommandMessage` | ground → inverter | **the command.** Selects channels, arms the logger |
-| `CInverterFullRateTelemetryMessage` | inverter → FSDR | the telemetry that comes back |
+| `CSignalAnalysisDataEngineCommandMessage` | ground -> inverter | Selects channels, arms the logger |
+| `CInverterFullRateTelemetryMessage` | inverter -> FSDR | the telemetry that comes back |
 
-This script sends the first one and receives the second one — but not in the same process,
-because the two ends need different source addresses. See [Receiving the
-telemetry](#receiving-the-telemetry).
+By default this script does both in one process: it streams the first one and reports the
+second one as it arrives. That only works where one namespace sees both addresses; under
+`run.sh` it does not, so split it into `--transmit-only` and `--receive-only` halves. See
+[Receiving the telemetry](#receiving-the-telemetry).
 
 ## Running it
 
 ```bash
-./run.sh                             # stream at 2 Hz until Ctrl-C
-./run.sh --channels 21,22,23 --rate 5
-./run.sh --stop                      # disable all slots and exit
-./run.sh --dry-run                   # print the message without sending
+./run.sh --tx                        # stream at 2 Hz until Ctrl-C
+./run.sh --tx --channels 21,22,23 --rate 5
 
-./run.sh --receive-only              # in a second terminal: receive the telemetry
-./run.sh --receive-only --csv /captures/run1.csv --dump 2
+./run.sh --rx                        # in a second terminal: receive the telemetry
+./run.sh --rx --csv /captures/run1.csv --dump 2
 ```
+
+Run bare (`./run.sh`), the script streams *and* receives in one process — convenient on a
+bench where one namespace owns both addresses, but not under `run.sh`, which can only join
+one container's netns. There, always pass `--tx` or `--rx`.
 
 `run.sh` does everything: on first use it builds a venv in the DDE image (a minute or two,
 then cached in `~/.cache/sendmsg-dde`), and every run wraps the script in `docker run`.
 Arguments pass straight through. It picks the network namespace from them: `--receive-only`
-runs in the FSDR's, everything else in a flight computer's.
+/ `--rx` runs in the FSDR's, everything else in a flight computer's.
 
 Two reasons it cannot just be `python send_qi_full_rate_telemetry.py`:
 
@@ -121,8 +121,10 @@ number. It does **not** need to be monotonic: a *lower* count reads as
 
 ## Receiving the telemetry
 
-`--receive-only` binds the port the inverter unicasts telemetry to and reports what arrives.
-It sends nothing, so it runs in its own terminal alongside a streaming sender.
+The telemetry socket is bound by default — the port the inverter unicasts telemetry to —
+and what arrives is reported. `--receive-only` (short: `--rx`) sends nothing while doing it,
+so it runs in its own terminal alongside a `--transmit-only` (`--tx`) sender whenever the two
+ends need different source addresses.
 
 ```
 schema CMessageUnifiedSchemaIdentifier(usid='a6c9ac2467680ff5'), receive only
@@ -153,9 +155,9 @@ port, over both flight critical networks:
 | `192.168.145.226:1771` | green, nothing owns this address in the sim lab |
 
 So the receiving socket has to be somewhere `.226` traffic lands, and the sending socket has
-to be a flight computer. No namespace is both, which is why receiving is a separate process:
-`run.sh --receive-only` shares the FSDR container's netns, everything else shares
-`flight_computer_2p1_remote_1`'s.
+to be a flight computer. No namespace in the sim lab is both, which is why the combined
+default cannot be used there: `run.sh --rx` shares the FSDR container's netns, everything
+else shares `flight_computer_2p1_remote_1`'s.
 
 Two consequences worth knowing:
 
@@ -179,13 +181,6 @@ Eight channels at one message per millisecond per network is ~16k messages/s, ea
 Every one of those views is subject to the float32 caveat under [Channels](#channels):
 integer and boolean channels read as garbage until the channel policy reaches `Read()`.
 
-### `--watch` instead
-
-`--watch` binds the same telemetry socket in the *sending* process. It is only useful where
-the sender's namespace happens to see `.226` traffic (say `--network host` on a bench with
-no FSDR), and it makes the send loop compete with decoding. `--receive-only` in its own
-terminal is the normal way.
-
 ## Options
 
 | Option | Default | Notes |
@@ -202,17 +197,15 @@ terminal is the normal way.
 | `--node-id` | `0` | `NodeIdOfOriginator` stamped on the message |
 | `--node-start-count` | `int(time.time())` | packet-header startup count; must differ per run — see above |
 | `--schema-hash` | local build | purple_rain USID to encode with |
-| `--stop` | | one command with all slots disabled, then exit |
 | `--disarm-on-exit` | | disable all slots on exit instead of waiting out the watchdog |
-| `--dry-run` | | print the message and exit without sending |
 | `--verbose` | | debug logging, and print every send |
 
 Receiving:
 
 | Option | Default | Notes |
 | --- | --- | --- |
-| `--receive-only` | | send nothing, only receive telemetry — needs the FSDR's netns |
-| `--watch` | | receive telemetry in the sending process too; rarely what you want |
+| `--receive-only` / `--rx` | | send nothing, only receive telemetry — needs the FSDR's netns |
+| `--transmit-only` / `--tx` | | only stream the command, do not bind the telemetry socket |
 | `--telemetry-ip` | `0.0.0.0` | local IP for the telemetry socket |
 | `--telemetry-port` | `1771` | the port the inverter unicasts telemetry to the FSDR on |
 | `--summary-interval` | `1.0` s | seconds between per-stream summaries |
@@ -263,8 +256,8 @@ The check is to receive the telemetry, in a second terminal, while the first one
 command:
 
 ```bash
-./run.sh                    # terminal 1: arm channels 1..8 at 2 Hz
-./run.sh --receive-only     # terminal 2: count what comes back
+./run.sh --tx               # terminal 1: arm channels 1..8 at 2 Hz
+./run.sh --rx               # terminal 2: count what comes back
 ```
 
 Eight streams at ~1000 msg/s each means the SADE armed and is publishing. `no telemetry`
@@ -324,7 +317,7 @@ is producing telemetry in that state, so `--receive-only` sits at `no telemetry`
 the wire instead.
 
 **Telemetry is on the wire but `--receive-only` reports nothing**
-Check the socket is in the right namespace first (`run.sh --receive-only` handles that). The
+Check the socket is in the right namespace first (`run.sh --rx` handles that). The
 other way to get silence is a subscription name mismatch: `cmessage_asyncio` keys
 subscriptions on the decoded message's own name, which is the `EMessageType` spelling
 (`eInverterFullRateTelemetryMessage`), not the class spelling the schema is indexed by
