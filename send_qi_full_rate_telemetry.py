@@ -419,7 +419,10 @@ async def run(args):
     for signal_name in ('SIGINT', 'SIGTERM'):
         loop.add_signal_handler(getattr(signal, signal_name), stop_event.set)
 
-    collector = receiver = csv_file = reporter = None
+    collector = None
+    receiver = None
+    csv_file = None
+    reporter = None
     try:
         if args.receive_only:
             receiver = await open_receiver(args, shape)
@@ -445,6 +448,7 @@ async def run(args):
             print('waiting for telemetry; Ctrl-C to stop')
             await stop_event.wait()
             return 0
+
         return await stream_commands(args, shape, command, stop_event)
     finally:
         if reporter is not None:
