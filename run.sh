@@ -35,7 +35,7 @@ fi
 NETWORK_CONTAINER="$FC_CONTAINER"
 SCRIPT_ARGS=(--local-ip "$FC_IP")
 for arg in "$@"; do
-   if [[ $arg == --receive-only ]]; then
+   if [[ $arg == --receive-only || $arg == --rx ]]; then
       NETWORK_CONTAINER="$FSDR_CONTAINER"
       SCRIPT_ARGS=()
    fi

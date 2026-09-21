@@ -391,7 +391,7 @@ async def run(args):
         return 2
 
     telemetry = None
-    if args.watching:
+    if args.receive_only:
         telemetry = message_spec(shape, TELEMETRY_MESSAGE)
         if telemetry is None:
             return 2
@@ -421,7 +421,7 @@ async def run(args):
 
     collector = receiver = csv_file = reporter = None
     try:
-        if args.watching:
+        if args.receive_only:
             receiver = await open_receiver(args, shape)
             if receiver is None:
                 return 2
@@ -442,7 +442,6 @@ async def run(args):
             reporter = asyncio.create_task(
                 report_periodically(collector, args.summary_interval))
 
-        if args.receive_only:
             print('waiting for telemetry; Ctrl-C to stop')
             await stop_event.wait()
             return 0
@@ -507,11 +506,7 @@ def main():
     parser.add_argument('--disarm-on-exit', action='store_true',
                         help='send an all-slots-disabled command on exit instead of letting '
                              'the 1 s watchdog time out')
-    parser.add_argument('--watch', action='store_true',
-                        help=f'also bind the telemetry port and report the '
-                             f'{TELEMETRY_MESSAGE} that arrives (only useful where the '
-                             "FSDR's address lands -- see README.md)")
-    parser.add_argument('--receive-only', action='store_true',
+    parser.add_argument('--receive-only', '--rx', action='store_true',
                         help='send nothing, just receive telemetry; run this in the FSDR '
                              "container's network namespace while a second instance streams "
                              'the command from a flight computer address')
@@ -533,14 +528,11 @@ def main():
     parser.add_argument('--verbose', action='store_true', help='verbose logging')
     args = parser.parse_args()
 
-    args.watching = args.watch or args.receive_only
-
-    if (args.csv or args.dump) and not args.watching:
-        parser.error('--csv/--dump only apply to received telemetry; add --watch or '
-                     '--receive-only')
+    if (args.csv or args.dump) and not args.receive_only:
+        parser.error('--csv/--dump only apply to received telemetry; add --receive-only')
     if args.summary_interval <= 0:
         parser.error('--summary-interval must be positive')
-    if args.watching and args.telemetry_ip not in FSDR_IPS + (DEFAULT_TELEMETRY_IP,):
+    if args.receive_only and args.telemetry_ip not in FSDR_IPS + (DEFAULT_TELEMETRY_IP,):
         print(f'warning: the inverter unicasts telemetry to the FSDR '
               f'({", ".join(FSDR_IPS)}),\nso nothing will arrive on {args.telemetry_ip}',
               file=sys.stderr)
