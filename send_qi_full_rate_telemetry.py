@@ -504,8 +504,6 @@ def main():
     parser.add_argument('--schema-hash', default=None,
                         help='purple_rain USID to decode/encode with '
                              '(default: the locally built flight_simulation_2p1_gcc package)')
-    parser.add_argument('--stop', action='store_true',
-                        help='send one command with all slots disabled and exit')
     parser.add_argument('--disarm-on-exit', action='store_true',
                         help='send an all-slots-disabled command on exit instead of letting '
                              'the 1 s watchdog time out')
@@ -537,8 +535,6 @@ def main():
 
     args.watching = args.watch or args.receive_only
 
-    if args.receive_only and args.stop:
-        parser.error('--receive-only sends nothing, so it cannot be combined with --stop')
     if (args.csv or args.dump) and not args.watching:
         parser.error('--csv/--dump only apply to received telemetry; add --watch or '
                      '--receive-only')
@@ -552,7 +548,7 @@ def main():
     if not args.receive_only:
         if args.rate <= 0:
             parser.error('--rate must be positive')
-        if not any(args.channels) and not args.stop:
+        if not any(args.channels):
             parser.error('no channels selected; every slot is the disabled sentinel 0')
         if args.local_ip not in FLIGHT_COMPUTER_IPS:
             print(f'warning: {args.local_ip} is not a flight computer address '
@@ -567,11 +563,6 @@ def main():
             print(f'warning: {len(args.decimation)} decimation values for '
                   f'{len(args.channels)} channels; unmatched slots get 0', file=sys.stderr)
 
-        # --stop is just "all slots disabled, once, no disarm".
-        if args.stop:
-            args.channels, args.decimation = [], []
-            args.count = 1
-            args.disarm_on_exit = False
         if args.rate <= 1.0 and args.count != 1:
             print(f'warning: {args.rate:g} Hz does not hold the engine watchdog open; '
                   'telemetry will start and stop', file=sys.stderr)
