@@ -411,12 +411,6 @@ async def run(args):
                 return 2
 
         command = build_command(spec, args)
-        if args.dry_run:
-            print(f'would send {COMMAND_MESSAGE} to {args.to}:{args.port} '
-                  f'from {args.local_ip}:{args.local_port}')
-            for key, value in stamptime(command).items():
-                print(f'  {key} = {value}')
-            return 0
     else:
         print(f'schema {shape.version}, receive only')
 
@@ -538,8 +532,6 @@ def main():
     parser.add_argument('--dump', type=int, default=0, metavar='N',
                         help='print the first N received messages in full, all samples '
                              '(default 0)')
-    parser.add_argument('--dry-run', action='store_true',
-                        help='print the message that would be sent and exit')
     parser.add_argument('--verbose', action='store_true', help='verbose logging')
     args = parser.parse_args()
 
