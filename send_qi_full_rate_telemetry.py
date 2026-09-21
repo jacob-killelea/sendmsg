@@ -341,16 +341,13 @@ async def stream_commands(args, shape, command, stop_event):
     # (cmessage_asyncio restarts seqno at 1 per connection). The clock gives that for free:
     # it need not be monotonic, since a lower count reads as eOutOfSequenceStartup, which
     # is also accepted and also resets the inverter's cache. Fits int32 until 2038.
-    startup_count = (args.node_start_count if args.node_start_count is not None
-                     else int(time.time()))
     connection = await CMessageUdpConnection.connect(
         args.local_ip, args.local_port,
         default_shape=shape,
         verbose=args.verbose,
-        node_start_count=startup_count,
+        node_start_count=1,
         reuse_port=True)
-    print(f'bound {args.local_ip}:{args.local_port} -> {args.to}:{args.port} '
-          f'(startup count {startup_count})')
+    print(f'bound {args.local_ip}:{args.local_port} -> {args.to}:{args.port}')
 
     active = [channel for channel in args.channels if channel]
     if active:
@@ -503,15 +500,9 @@ def main():
                         help='EPosition of the target LRU (default %(default)s = 1A)')
     parser.add_argument('--node-id', type=int, default=0,
                         help='NodeIdOfOriginator to stamp on the command (default %(default)s)')
-    parser.add_argument('--node-start-count', type=int, default=None,
-                        help='packet-header startup count (default: the clock, so each run '
-                             'presents a value the last one did not and reads as a node '
-                             "restart to the inverter's sequence checker)")
     parser.add_argument('--schema-hash', default=None,
                         help='purple_rain USID to decode/encode with '
                              '(default: the locally built flight_simulation_2p1_gcc package)')
-    parser.add_argument('--stop', action='store_true',
-                        help='send one command with all slots disabled and exit')
     parser.add_argument('--disarm-on-exit', action='store_true',
                         help='send an all-slots-disabled command on exit instead of letting '
                              'the 1 s watchdog time out')
@@ -545,8 +536,6 @@ def main():
 
     args.watching = args.watch or args.receive_only
 
-    if args.receive_only and args.stop:
-        parser.error('--receive-only sends nothing, so it cannot be combined with --stop')
     if (args.csv or args.dump) and not args.watching:
         parser.error('--csv/--dump only apply to received telemetry; add --watch or '
                      '--receive-only')
@@ -560,7 +549,7 @@ def main():
     if not args.receive_only:
         if args.rate <= 0:
             parser.error('--rate must be positive')
-        if not any(args.channels) and not args.stop:
+        if not any(args.channels):
             parser.error('no channels selected; every slot is the disabled sentinel 0')
         if args.local_ip not in FLIGHT_COMPUTER_IPS:
             print(f'warning: {args.local_ip} is not a flight computer address '
@@ -575,11 +564,6 @@ def main():
             print(f'warning: {len(args.decimation)} decimation values for '
                   f'{len(args.channels)} channels; unmatched slots get 0', file=sys.stderr)
 
-        # --stop is just "all slots disabled, once, no disarm".
-        if args.stop:
-            args.channels, args.decimation = [], []
-            args.count = 1
-            args.disarm_on_exit = False
         if args.rate <= 1.0 and args.count != 1:
             print(f'warning: {args.rate:g} Hz does not hold the engine watchdog open; '
                   'telemetry will start and stop', file=sys.stderr)
