@@ -391,7 +391,7 @@ async def run(args):
         return 2
 
     telemetry = None
-    if args.receive_only:
+    if not args.transmit_only:
         telemetry = message_spec(shape, TELEMETRY_MESSAGE)
         if telemetry is None:
             return 2
@@ -424,7 +424,7 @@ async def run(args):
     csv_file = None
     reporter = None
     try:
-        if args.receive_only:
+        if not args.transmit_only:
             receiver = await open_receiver(args, shape)
             if receiver is None:
                 return 2
@@ -445,6 +445,7 @@ async def run(args):
             reporter = asyncio.create_task(
                 report_periodically(collector, args.summary_interval))
 
+        if args.receive_only:
             print('waiting for telemetry; Ctrl-C to stop')
             await stop_event.wait()
             return 0
@@ -510,10 +511,13 @@ def main():
     parser.add_argument('--disarm-on-exit', action='store_true',
                         help='send an all-slots-disabled command on exit instead of letting '
                              'the 1 s watchdog time out')
-    parser.add_argument('--receive-only', '--rx', action='store_true',
-                        help='send nothing, just receive telemetry; run this in the FSDR '
-                             "container's network namespace while a second instance streams "
-                             'the command from a flight computer address')
+    sides = parser.add_mutually_exclusive_group()
+    sides.add_argument('--receive-only', '--rx', action='store_true',
+                       help='send nothing, just receive telemetry; run this in the FSDR '
+                            "container's network namespace while a second instance streams "
+                            'the command from a flight computer address')
+    sides.add_argument('--transmit-only', '--tx', action='store_true',
+                       help='only stream the command, do not bind the telemetry socket')
     parser.add_argument('--telemetry-ip', default=DEFAULT_TELEMETRY_IP,
                         help='local IP for the telemetry socket (default %(default)s, i.e. '
                              f'whichever of {" / ".join(FSDR_IPS)} this namespace owns)')
@@ -532,11 +536,12 @@ def main():
     parser.add_argument('--verbose', action='store_true', help='verbose logging')
     args = parser.parse_args()
 
-    if (args.csv or args.dump) and not args.receive_only:
-        parser.error('--csv/--dump only apply to received telemetry; add --receive-only')
+    if (args.csv or args.dump) and args.transmit_only:
+        parser.error('--csv/--dump only apply to received telemetry, which --transmit-only '
+                     'disables')
     if args.summary_interval <= 0:
         parser.error('--summary-interval must be positive')
-    if args.receive_only and args.telemetry_ip not in FSDR_IPS + (DEFAULT_TELEMETRY_IP,):
+    if not args.transmit_only and args.telemetry_ip not in FSDR_IPS + (DEFAULT_TELEMETRY_IP,):
         print(f'warning: the inverter unicasts telemetry to the FSDR '
               f'({", ".join(FSDR_IPS)}),\nso nothing will arrive on {args.telemetry_ip}',
               file=sys.stderr)

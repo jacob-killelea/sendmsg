@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Arm full-rate telemetry on Quad Inverter 1A from inside the DDE container, or receive the
 # telemetry it publishes. Arguments pass through:
-#   ./run.sh --channels 21,22,23 --rate 5     # arm, from a flight computer address
-#   ./run.sh --receive-only --dump 2          # receive, from the FSDR's address
+#   ./run.sh --tx --channels 21,22,23 --rate 5   # arm, from a flight computer address
+#   ./run.sh --rx --dump 2                       # receive, from the FSDR's address
+# A container joins one netns, so the script's send-and-receive default cannot work here:
+# pass --tx or --rx.
 # See README.md for why this needs a container and someone else's network namespace.
 
 set -euo pipefail
@@ -31,15 +33,31 @@ fi
 
 # Sending and receiving need different addresses, and so different namespaces: the inverter
 # drops commands that are not sourced from a flight computer, and it unicasts the telemetry
-# to the FSDR. Nothing owns both addresses, so --receive-only is its own process.
+# to the FSDR. Nothing owns both addresses, so --rx is its own process.
 NETWORK_CONTAINER="$FC_CONTAINER"
 SCRIPT_ARGS=(--local-ip "$FC_IP")
+SIDE=""
 for arg in "$@"; do
-   if [[ $arg == --receive-only || $arg == --rx ]]; then
-      NETWORK_CONTAINER="$FSDR_CONTAINER"
-      SCRIPT_ARGS=()
-   fi
+   case $arg in
+      --receive-only|--rx)
+         NETWORK_CONTAINER="$FSDR_CONTAINER"
+         SCRIPT_ARGS=()
+         SIDE="rx"
+         ;;
+      --transmit-only|--tx)
+         SIDE="tx"
+         ;;
+   esac
 done
+
+if [[ -z $SIDE ]]; then
+   cat >&2 <<WARN
+warning: neither --tx nor --rx given, so the script will send and receive in one process --
+  but this container only has $FC_CONTAINER's addresses ($FC_IP), and the inverter unicasts
+  the telemetry to the FSDR at .226, which nothing here owns. Expect the command to land and
+  no telemetry to arrive. Run --tx here and --rx in a second terminal instead.
+WARN
+fi
 
 # docker refuses -t when stdin/stdout are not a terminal, which would break piping.
 TTY_FLAGS=(); [[ -t 0 && -t 1 ]] && TTY_FLAGS=(-it)
